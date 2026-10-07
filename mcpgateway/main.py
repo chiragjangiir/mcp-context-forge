@@ -84,8 +84,8 @@ from mcpgateway.auth_context import (
     get_token_teams_from_request,
     get_user_email,
     import_envelope_includes_roots,
-    is_unrestricted_platform_admin,
     is_trusted_internal_mcp_request,
+    is_unrestricted_platform_admin,
     selective_selection_includes_roots,
 )
 from mcpgateway.cache import ResourceCache, SessionRegistry
@@ -217,9 +217,10 @@ from mcpgateway.services.mcp_apps import (
     MCPAppsValidationError,
     serialize_resource_content_for_mcp,
 )
+from mcpgateway.services.mcp_catalog_service import list_catalog_page
 from mcpgateway.services.mcp_method_registry import mcp_method_registry
-from mcpgateway.services.modern_listener_service import get_modern_listener_service, init_modern_listener_service
 from mcpgateway.services.metrics import setup_metrics
+from mcpgateway.services.modern_listener_service import get_modern_listener_service, init_modern_listener_service
 from mcpgateway.services.permission_service import PermissionService
 from mcpgateway.services.prompt_service import PromptError, PromptLockConflictError, PromptNameConflictError, PromptNotFoundError, PromptUpstreamError, PromptValidationError
 from mcpgateway.services.resource_service import ResourceError, ResourceLockConflictError, ResourceNotFoundError, ResourceURIConflictError, ResourceValidationError
@@ -8495,6 +8496,34 @@ async def handle_internal_mcp_notifications_cancelled(request: Request):
         )
 
 
+async def _catalog_page_for_request(request: Request, db: Session, user: Any, method: str, server_id: Optional[str], cursor: Any = None, meta: Any = None) -> dict[str, Any]:
+    """Serve an authorized MCP list request through the shared catalog service.
+
+    Args:
+        request: Authenticated request.
+        db: Request database session.
+        user: Authenticated principal.
+        method: MCP list method.
+        server_id: Authorized virtual server scope.
+        cursor: Client pagination cursor.
+        meta: Original request metadata.
+
+    Returns:
+        Bounded MCP list result.
+    """
+    user_email, token_teams = get_scoped_resource_access_context(request, user)
+    return await list_catalog_page(
+        db,
+        method,
+        server_id=server_id,
+        cursor=cursor,
+        user_email=user_email,
+        token_teams=token_teams,
+        request_headers=dict(request.headers),
+        meta=meta,
+    )
+
+
 @utility_router.post("/_internal/mcp/tools/list/")
 @utility_router.post("/_internal/mcp/tools/list")
 async def handle_internal_mcp_tools_list(request: Request):
@@ -8522,15 +8551,14 @@ async def handle_internal_mcp_tools_list(request: Request):
             method="tools/list",
             server_id=server_id,
         )
-        user_email, token_teams = get_scoped_resource_access_context(request, user)
-
-        tools = await tool_service.list_server_mcp_tool_definitions(
-            db,
-            server_id,
-            user_email=user_email,
-            token_teams=token_teams,
-        )
-        return ORJSONResponse(content={"tools": tools})
+        raw_body = await request.body()
+        body = orjson.loads(raw_body) if raw_body else {}
+        params = body.get("params", {}) if isinstance(body, dict) else None
+        if not isinstance(params, dict):
+            raise JSONRPCError(-32602, "Invalid list parameters")
+        payload = await _catalog_page_for_request(request, db, user, "tools/list", server_id, params.get("cursor"), params.get("_meta"))
+        db.commit()
+        return ORJSONResponse(content=payload)
     except HTTPException:
         try:
             db.rollback()
@@ -8541,7 +8569,7 @@ async def handle_internal_mcp_tools_list(request: Request):
                 pass  # nosec B110 - Best effort cleanup on connection failure
         raise
     except JSONRPCError as exc:
-        return ORJSONResponse(status_code=403, content={"code": exc.code, "message": exc.message, "data": exc.data})
+        return ORJSONResponse(status_code=400 if exc.code == -32602 else 403, content={"code": exc.code, "message": exc.message, "data": exc.data})
     except Exception as exc:
         logger.exception("Unexpected error in handle_internal_mcp_tools_list")
         try:
@@ -8603,7 +8631,6 @@ async def handle_internal_mcp_resources_list(request: Request):
             _enforce_internal_mcp_server_scope(request, server_id)
         else:
             server_id = params.get("server_id")
-        cursor = params.get("cursor")
 
         await _authorize_internal_mcp_request(
             request,
@@ -8613,33 +8640,13 @@ async def handle_internal_mcp_resources_list(request: Request):
             server_id=server_id,
         )
 
-        user_email, token_teams = get_scoped_resource_access_context(request, user)
-
-        if server_id:
-            resources = await resource_service.list_server_resources(
-                db,
-                server_id,
-                user_email=user_email,
-                token_teams=token_teams,
-            )
-            payload = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
-        else:
-            resources, next_cursor = await resource_service.list_resources(
-                db,
-                cursor=cursor,
-                limit=0,
-                user_email=user_email,
-                token_teams=token_teams,
-            )
-            payload = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
-            if next_cursor:
-                payload["nextCursor"] = next_cursor
+        payload = await _catalog_page_for_request(request, db, user, "resources/list", server_id, params.get("cursor"), params.get("_meta"))
 
         if db.is_active and db.in_transaction() is not None:
             db.commit()
         return ORJSONResponse(content=payload)
     except JSONRPCError as exc:
-        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+        return ORJSONResponse(status_code=400 if exc.code == -32602 else 403, content=exc.to_dict()["error"])
     except Exception as exc:
         logger.exception("Unexpected error in handle_internal_mcp_resources_list")
         try:
@@ -9029,22 +9036,13 @@ async def handle_internal_mcp_resource_templates_list(request: Request):
             server_id=server_id,
         )
 
-        # SECURITY (Layer 1): (None, None) for admin bypass triggers the private-exclusion WHERE clause in the service.
-        auth_user_email, auth_token_teams = get_scoped_resource_access_context(request, user)
-
-        resource_templates = await resource_service.list_resource_templates(
-            db,
-            user_email=auth_user_email,
-            token_teams=auth_token_teams,
-            server_id=server_id,
-        )
-        payload = {"resourceTemplates": [rt.model_dump(by_alias=True, exclude_none=True) for rt in resource_templates]}
+        payload = await _catalog_page_for_request(request, db, user, "resources/templates/list", server_id, params.get("cursor"), params.get("_meta"))
 
         if db.is_active and db.in_transaction() is not None:
             db.commit()
         return ORJSONResponse(content=payload)
     except JSONRPCError as exc:
-        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+        return ORJSONResponse(status_code=400 if exc.code == -32602 else 403, content=exc.to_dict()["error"])
     except Exception:
         try:
             db.rollback()
@@ -9409,7 +9407,6 @@ async def handle_internal_mcp_prompts_list(request: Request):
             _enforce_internal_mcp_server_scope(request, server_id)
         else:
             server_id = params.get("server_id")
-        cursor = params.get("cursor")
 
         await _authorize_internal_mcp_request(
             request,
@@ -9419,34 +9416,13 @@ async def handle_internal_mcp_prompts_list(request: Request):
             server_id=server_id,
         )
 
-        user_email, token_teams = get_scoped_resource_access_context(request, user)
-
-        if server_id:
-            prompts = await prompt_service.list_server_prompts(
-                db,
-                server_id,
-                cursor=cursor,
-                user_email=user_email,
-                token_teams=token_teams,
-            )
-            payload = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
-        else:
-            prompts, next_cursor = await prompt_service.list_prompts(
-                db,
-                cursor=cursor,
-                limit=0,
-                user_email=user_email,
-                token_teams=token_teams,
-            )
-            payload = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
-            if next_cursor:
-                payload["nextCursor"] = next_cursor
+        payload = await _catalog_page_for_request(request, db, user, "prompts/list", server_id, params.get("cursor"), params.get("_meta"))
 
         if db.is_active and db.in_transaction() is not None:
             db.commit()
         return ORJSONResponse(content=payload)
     except JSONRPCError as exc:
-        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+        return ORJSONResponse(status_code=400 if exc.code == -32602 else 403, content=exc.to_dict()["error"])
     except Exception:
         try:
             db.rollback()
@@ -9604,7 +9580,7 @@ async def handle_internal_mcp_tools_list_authz(request: Request):
         request: Trusted internal MCP authz request.
 
     Returns:
-        Empty success response when the request is authorized.
+        Catalog visibility when the list request is authorized.
     """
     return await _authorize_internal_mcp_server_scoped_method(
         request,
@@ -9642,7 +9618,7 @@ async def _authorize_internal_mcp_server_scoped_method(
 
     db = SessionLocal()
     try:
-        await _authorize_internal_mcp_request(
+        user = await _authorize_internal_mcp_request(
             request,
             db,
             permission=permission,
@@ -9660,6 +9636,18 @@ async def _authorize_internal_mcp_server_scoped_method(
                     "directExecutionEligible": False,
                     "fallbackReason": fallback_reason,
                 },
+            )
+        if method in ("tools/list", "resources/list", "prompts/list", "resources/templates/list"):
+            # First-Party
+            from mcpgateway.utils.admin_check import is_user_admin  # pylint: disable=import-outside-toplevel
+
+            email, teams = get_scoped_resource_access_context(request, user)
+            admin = teams is None and (email is None or bool(is_user_admin(db, email)))
+            return ORJSONResponse(
+                content={
+                    "directExecutionEligible": not (settings.mcpgateway_mcp_apps_enabled and method in ("tools/list", "resources/list")),
+                    "catalogVisibility": {"email": email, "teams": teams, "admin": admin},
+                }
             )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     except JSONRPCError as exc:
@@ -9713,7 +9701,7 @@ async def handle_internal_mcp_resources_list_authz(request: Request):
         request: Trusted internal MCP authz request.
 
     Returns:
-        Empty success response when the request is authorized.
+        Catalog visibility when the list request is authorized.
     """
     return await _authorize_internal_mcp_server_scoped_method(
         request,
@@ -9749,7 +9737,7 @@ async def handle_internal_mcp_resource_templates_list_authz(request: Request):
         request: Trusted internal MCP authz request.
 
     Returns:
-        Empty success response when the request is authorized.
+        Catalog visibility when the list request is authorized.
     """
     return await _authorize_internal_mcp_server_scoped_method(
         request,
@@ -9767,7 +9755,7 @@ async def handle_internal_mcp_prompts_list_authz(request: Request):
         request: Trusted internal MCP authz request.
 
     Returns:
-        Empty success response when the request is authorized.
+        Catalog visibility when the list request is authorized.
     """
     return await _authorize_internal_mcp_server_scoped_method(
         request,
@@ -10411,7 +10399,7 @@ async def _maybe_forward_affinitized_rpc_request(
 
     if settings.mcpgateway_session_affinity_enabled and mcp_session_id and method != "initialize" and not is_internally_forwarded:
         # First-Party
-        from mcpgateway.services.session_affinity import SessionAffinity, get_worker_id  # pylint: disable=import-outside-toplevel
+        from mcpgateway.services.session_affinity import get_worker_id, SessionAffinity  # pylint: disable=import-outside-toplevel
 
         if not SessionAffinity.is_valid_mcp_session_id(mcp_session_id):
             logger.debug("Invalid MCP session id for affinity forwarding, executing locally")
@@ -11375,17 +11363,12 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
                 server_id=server_id,
                 mcp_session_id=mcp_session_id,
             )
-        elif method == "tools/list":
-            await _ensure_rpc_permission(user, db, "tools.read", method, request=request)
-            result = await _handle_tools_list_rpc(
-                request=request,
-                db=db,
-                user=user,
-                tool_svc=tool_service,
-                server_id=server_id,
-                cursor=cursor,
-                serializer_func=_serialize_mcp_tool_definitions,
-            )
+        elif method in ("tools/list", "resources/list", "prompts/list", "resources/templates/list"):
+            permission = {"tools/list": "tools.read", "prompts/list": "prompts.read"}.get(method, "resources.read")
+            await _ensure_rpc_permission(user, db, permission, method, request=request)
+            result = await _catalog_page_for_request(request, db, user, method, server_id, cursor, params.get("_meta"))
+            db.commit()
+            db.close()
         elif method == "list_tools":  # Legacy endpoint
             await _ensure_rpc_permission(user, db, "tools.read", method, request=request)
             result = await _handle_tools_list_rpc(
@@ -11412,21 +11395,6 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
                 raise JSONRPCError(-32003, _ACCESS_DENIED_MSG, {"method": method})
             roots = await root_service.list_roots()
             result = {"roots": [r.model_dump(by_alias=True, exclude_none=True) for r in roots]}
-        elif method == "resources/list":
-            await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
-            user_email, token_teams = get_scoped_resource_access_context(request, user)
-            if server_id:
-                resources = await resource_service.list_server_resources(db, server_id, user_email=user_email, token_teams=token_teams)
-                db.commit()
-                db.close()
-                result = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
-            else:
-                resources, next_cursor = await resource_service.list_resources(db, cursor=cursor, limit=0, user_email=user_email, token_teams=token_teams)
-                db.commit()
-                db.close()
-                result = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
-                if next_cursor:
-                    result["nextCursor"] = next_cursor
         elif method == "resources/read":
             await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
             uri = params.get("uri")
@@ -11498,21 +11466,6 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
             db.commit()
             db.close()
             result = {}
-        elif method == "prompts/list":
-            await _ensure_rpc_permission(user, db, "prompts.read", method, request=request)
-            user_email, token_teams = get_scoped_resource_access_context(request, user)
-            if server_id:
-                prompts = await prompt_service.list_server_prompts(db, server_id, cursor=cursor, user_email=user_email, token_teams=token_teams)
-                db.commit()
-                db.close()
-                result = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
-            else:
-                prompts, next_cursor = await prompt_service.list_prompts(db, cursor=cursor, limit=0, user_email=user_email, token_teams=token_teams)
-                db.commit()
-                db.close()
-                result = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
-                if next_cursor:
-                    result["nextCursor"] = next_cursor
         elif method == "prompts/get":
             await _ensure_rpc_permission(user, db, "prompts.read", method, request=request)
             name = params.get("name")
@@ -11581,20 +11534,6 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
                 db.commit()
                 db.close()
         # TODO: Implement methods  # pylint: disable=fixme
-        elif method == "resources/templates/list":
-            await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
-            # SECURITY (Layer 1): (None, None) for admin bypass triggers the private-exclusion WHERE clause in the service.
-            auth_user_email, auth_token_teams = get_scoped_resource_access_context(request, user)
-
-            resource_templates = await resource_service.list_resource_templates(
-                db,
-                user_email=auth_user_email,
-                token_teams=auth_token_teams,
-                server_id=server_id,
-            )
-            db.commit()
-            db.close()
-            result = {"resourceTemplates": [rt.model_dump(by_alias=True, exclude_none=True) for rt in resource_templates]}
         elif method == "roots/list":
             # MCP spec-compliant method name
             await _ensure_rpc_permission(user, db, "admin.system_config", method, request=request)
