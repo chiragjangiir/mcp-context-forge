@@ -3508,6 +3508,7 @@ async def _list_catalog_page(method: str, params: Any) -> dict[str, Any]:
                 token_teams=token_teams,
                 request_headers=headers,
                 meta=meta,
+                model_items=True,
             )
             db.commit()
             return payload
